@@ -1,0 +1,30 @@
+- update fatto appena raggiunto il quorum, anche se non tutti i nodi hanno salvato i dato
+//////////////////////////
+- 🔁 Perché prima hai ricevuto v=3, ora v=5?
+Anche senza cambiare il codice, l'ordine dei messaggi può cambiare ad ogni esecuzione per via di:
+
+🎲 1. Non determinismo nella rete di attori
+Akka non garantisce l'ordine globale dei messaggi
+
+Quando node30 invia InternalGet a tre nodi, le ValueResponse possono arrivare in qualunque ordine
+
+Appena ricevi 2 risposte (quorum R=2), selezioni il valore con max(version) tra quei due
+→ se i primi 2 arrivi sono v=3 e v=1, ritorni v=3
+→ se i primi 2 sono v=5 e v=3, ritorni v=5
+
+
+
+
+/////////////////////////////
+Recovery:
+ Dopo il recovery di Node20
+less
+Copia
+Modifica
+[Node 20] keys in localStorage: []
+✔️ Questo è il momento chiave.
+Dopo il recovery, Node20 non conserva più key=55, perché:
+
+non è più tra i responsabili di quella chiave
+
+il codice di recovery ha correttamente rimosso la chiave non di sua competenza
