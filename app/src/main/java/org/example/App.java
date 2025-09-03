@@ -3,162 +3,167 @@ package org.example;
 import akka.actor.*;
 import org.example.Messages.*;
 
-import java.time.LocalTime;
-import java.time.format.DateTimeFormatter;
-
 public class App {
-    private static RingManager ring;
-    private static final DateTimeFormatter fmt = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
 
-    public static void main(String[] args) {
-        ActorSystem system = ActorSystem.create("MarsSystem");
-        ring = new RingManager(Config.NODES);
+    public static void main(String[] args) throws Exception {
+        final ActorSystem system = ActorSystem.create("ds1");
+        final RingManager ring = new RingManager(Config.NODES);
 
-        ActorRef client1 = system.actorOf(Props.create(ClientActor.class), "client1");
-        ActorRef client2 = system.actorOf(Props.create(ClientActor.class), "client2");
+        try {
+            // ======== NODI INIZIALI (3) ========
+            final ActorRef node10 = system.actorOf(Props.create(NodeActor.class, 10, ring), "node10");
+            final ActorRef node20 = system.actorOf(Props.create(NodeActor.class, 20, ring), "node20");
+            final ActorRef node30 = system.actorOf(Props.create(NodeActor.class, 30, ring), "node30");
 
-        // === BOOTSTRAP: 3 nodi (10,20,30) ===
-        ActorRef n10 = system.actorOf(makeProps(10), "node10");
-        ActorRef n20 = system.actorOf(makeProps(20), "node20");
-        ActorRef n30 = system.actorOf(makeProps(30), "node30");
-        ring.addNode(10, n10);
-        ring.addNode(20, n20);
-        ring.addNode(30, n30);
+            ring.addNode(10, node10);
+            ring.addNode(20, node20);
+            ring.addNode(30, node30);
 
-        banner("SETUP INIZIALE");
-        log("Ring attivo con nodi: 10,20,30");
-        sleep(400);
+            // ======== CLIENT ========
+            final ActorRef clientA = system.actorOf(Props.create(TestClient.class), "clientA");
+            final ActorRef clientB = system.actorOf(Props.create(TestClient.class), "clientB"); // per concorrenza
 
-        // ============================================================
-        // TEST 1 — Sequential Consistency: GET durante WRITE stessa key
-        // ============================================================
-        banner("TEST 1 — GET durante WRITE (Sequential Consistency)");
+            printSection("SETUP INIZIALE");
+            System.out.println("[*] Ring attivo con nodi: 10,20,30");
+            Thread.sleep(600);
 
-        log("Seed: UPDATE key=42 -> v='Temp: -60C' (client1)");
-        n10.tell(new UpdateRequest(42, "Temp: -60C"), client1);
-        sleep(600);
+            // ======== GUARD PARAMETRI ========
+            if (Config.W > Config.N || Config.R > Config.N) {
+                throw new IllegalArgumentException("Parametri non validi: W,R devono essere <= N");
+            }
+            if (ring.getNodeMap().size() < Config.N) {
+                System.out.println("[WARN] N=" + Config.N + " > nodi attivi=" + ring.getNodeMap().size()
+                        + " → possibili fallimenti di quorum");
+            }
 
-        log("Inizio WRITE concorrente: key=42 -> v='Temp: -59C' (client2)");
-        n20.tell(new UpdateRequest(42, "Temp: -59C"), client2);
+            // ======== TEST 1 — WRITE + READ base ========
+            printSection("TEST 1 — WRITE + READ base");
+            clientA.tell("INFO: UPDATE key=42 -> 'Temp: -60C'", ActorRef.noSender());
+            // invio a un nodo qualsiasi: il coordinatore verrà scelto/forwardato
+            node10.tell(new UpdateRequest(42, "Temp: -60C"), clientA);
+            Thread.sleep(1200);
 
-        // Subito due GET concorrenti sulla stessa key
-        log("Subito dopo la WRITE: due GET concorrenti su key=42 (client1 & client2)");
-        n30.tell(new GetRequest(42), client1);
-        n10.tell(new GetRequest(42), client2);
+            clientA.tell("INFO: GET key=42", ActorRef.noSender());
+            node30.tell(new GetRequest(42), clientA);
+            Thread.sleep(1000);
 
-        // Se il codice blocca o rifiuta queste GET, lo vediamo dai log/tempi
-        sleep(1500);
-        printStorage(system, "DUMP dopo TEST 1");
+            // ======== TEST 2 — WRITE concorrenti (stessa key) ========
+            printSection("TEST 2 — WRITE concorrenti (stessa key)");
+            final int kCW = 99;
+            ActorRef primaryCW = ring.getResponsibleNodes(kCW).get(0); // inviamo entrambe al primary per forzare serializzazione
+            clientA.tell("INFO: Due UPDATE concorrenti su key=" + kCW, ActorRef.noSender());
+            primaryCW.tell(new UpdateRequest(kCW, "Pressure: 720Pa"), clientA);
+            // quasi in contemporanea
+            primaryCW.tell(new UpdateRequest(kCW, "Pressure: 715Pa"), clientB);
+            Thread.sleep(2000);
 
-        // ============================================================
-        // TEST 2 — JOIN: broadcast + read-back a versione più recente
-        // Chiave "di frontiera": 23 (prima del join apparteneva al vecchio set)
-        // ============================================================
-        banner("TEST 2 — JOIN (broadcast + read-back)");
+            clientA.tell("INFO: GET key=" + kCW + " (deve vedere l'ultima versione)", ActorRef.noSender());
+            primaryCW.tell(new GetRequest(kCW), clientA);
+            Thread.sleep(1000);
 
-        log("Seed: doppio UPDATE rapido su key=23 -> 'A' poi 'B' (per avere versione alta prima del join)");
-        n10.tell(new UpdateRequest(23, "A"), client1);
-        sleep(200);
-        n20.tell(new UpdateRequest(23, "B"), client2);
-        sleep(800);
+            // ======== TEST 3 — WRITE + READ concorrenti (Sequential Consistency) ========
+            printSection("TEST 3 — WRITE + READ concorrenti (Sequential Consistency)");
+            final int kSC = 123;
+            ActorRef primarySC = ring.getResponsibleNodes(kSC).get(0);
 
-        log("JOIN di nodo 25");
-        ActorRef n25 = system.actorOf(makeProps(25), "node25");
-        n10.tell(new JoinRequest(25, n25), client1);
+            clientA.tell("INFO: UPDATE key=" + kSC + " -> 'VAL: A'", ActorRef.noSender());
+            primarySC.tell(new UpdateRequest(kSC, "VAL: A"), clientA);
+            Thread.sleep(1000);
 
-        // Subito GET sulla key=23: il nuovo responsabile dovrebbe già essere coerente e con versione più recente
-        sleep(1200);
-        log("GET key=23 da client1 e client2 (dopo join)");
-        n25.tell(new GetRequest(23), client1);
-        n20.tell(new GetRequest(23), client2);
+            clientA.tell("INFO: Avvio WRITE key=" + kSC + " -> 'VAL: B' e SUBITO una GET sulla stessa key al primary", ActorRef.noSender());
+            primarySC.tell(new UpdateRequest(kSC, "VAL: B"), clientA);
+            // GET subito sullo stesso primary (dove c'è la coda write) → deve essere rifiutata
+            primarySC.tell(new GetRequest(kSC), clientA);
+            Thread.sleep(1500);
 
-        sleep(1200);
-        printStorage(system, "DUMP dopo TEST 2 (post-JOIN)");
+            clientA.tell("INFO: GET key=" + kSC + " dopo il commit (deve leggere VAL: B)", ActorRef.noSender());
+            node10.tell(new GetRequest(kSC), clientA);
+            Thread.sleep(1000);
 
-        // ============================================================
-        // TEST 3 — LEAVE: i dati vanno ai veri nuovi responsabili (N repliche), non solo al successore
-        // Usiamo una chiave che coinvolgeva 30 tra i responsabili: 55
-        // ============================================================
-        banner("TEST 3 — LEAVE verso veri nuovi responsabili (non solo successore)");
+            // ======== TEST 4 — CRASH di un nodo (node20) ========
+            printSection("TEST 4 — CRASH di node20");
+            clientA.tell("INFO: Stopping node20 (crash simulato)", ActorRef.noSender());
+            system.stop(node20); // crash: NON rimuovere dal ring
+            Thread.sleep(800);
 
-        log("Seed: UPDATE key=55 -> 'CO2: 12%'");
-        n10.tell(new UpdateRequest(55, "CO2: 12%"), client1);
-        sleep(800);
+            // ======== TEST 5 — WRITE con 1 replica down (W=2) ========
+            printSection("TEST 5 — WRITE con 1 replica down (W=2)");
+            clientA.tell("INFO: UPDATE key=42 -> 'Temp: -59C' (node20 giù)", ActorRef.noSender());
+            node30.tell(new UpdateRequest(42, "Temp: -59C"), clientA);
+            Thread.sleep(1500);
 
-        log("LEAVE di nodo 30");
-        n30.tell(new LeaveRequest(30), client2);
+            // ======== TEST 6 — RECOVERY del nodo crashed ========
+            printSection("TEST 6 — RECOVERY di node20");
+            clientA.tell("INFO: Ricreo node20 e invio RecoverRequest(20, bootstrap=node10)", ActorRef.noSender());
+            final ActorRef node20r = system.actorOf(Props.create(NodeActor.class, 20, ring), "node20_recovered");
+            node20r.tell(new RecoverRequest(20, node10), clientA);
+            Thread.sleep(2000);
 
-        // Subito GET da due nodi diversi per vedere dove è andata a finire la chiave
-        sleep(1200);
-        log("GET key=55 da client1 & client2 (post-LEAVE)");
-        n10.tell(new GetRequest(55), client1);
-        n25.tell(new GetRequest(55), client2);
+            clientA.tell("INFO: GET key=42 dopo recovery (tutte le repliche devono convergere alla v più alta)", ActorRef.noSender());
+            node10.tell(new GetRequest(42), clientA);
+            Thread.sleep(1000);
 
-        sleep(1200);
-        printStorage(system, "DUMP dopo TEST 3 (post-LEAVE)");
+            // ======== TEST 7 — JOIN di un nuovo nodo (node40) ========
+            printSection("TEST 7 — JOIN di node40");
+            final ActorRef node40 = system.actorOf(Props.create(NodeActor.class, 40, ring), "node40");
+            // chiediamo al bootstrap (node10) di servire la join: invia NodeListResponse a node40,
+            // poi node40 farà TransferKeysRequest al suo successore → trasferimento selettivo
+            node10.tell(new JoinRequest(40, node40), clientA);
+            Thread.sleep(2000);
 
-        // ============================================================
-        // TEST 4 — CRASH + RECOVERY: aggiornamenti durante lo stop e riallineamento alla versione più recente
-        // ============================================================
-        banner("TEST 4 — CRASH + RECOVERY con aggiornamenti durante il down");
+            // verifica con GET su alcune key (compresa 42)
+            clientA.tell("INFO: GET key=42 dopo JOIN (deve restare coerente)", ActorRef.noSender());
+            node40.tell(new GetRequest(42), clientA);
+            Thread.sleep(1000);
 
-        log("CRASH simulato di nodo 20 (stop actor)");
-        system.stop(n20);
-        sleep(600);
+            // ======== TEST 8 — LEAVE di un nodo (node30) ========
+            printSection("TEST 8 — LEAVE di node30");
+            node30.tell(new LeaveRequest(30), clientA); // trasferisce ai nuovi responsabili, notifica e si ferma
+            Thread.sleep(2000);
 
-        log("Durante il crash: UPDATE key=42 -> 'Temp: -58C' (avanza versione)");
-        n10.tell(new UpdateRequest(42, "Temp: -58C"), client1);
-        sleep(1000);
+            clientA.tell("INFO: GET key=42 dopo LEAVE (deve restare coerente)", ActorRef.noSender());
+            node10.tell(new GetRequest(42), clientA);
+            Thread.sleep(1000);
 
-        log("RECOVERY di nodo 20");
-        ActorRef recovered20 = system.actorOf(makeProps(20), "node20_recovered");
-        ring.addNode(20, recovered20);
-        recovered20.tell(new RecoverRequest(20), client2);
+            // ======== TEST 9 — NO QUORUM (opzionale, mostra timeout su GET/UPDATE) ========
+            printSection("TEST 9 — NO QUORUM (dimostrazione timeout)");
+            clientA.tell("INFO: Spengo node10 e node40 → resta solo node20_recovered. Con N=3,R=2: GET deve fallire.", ActorRef.noSender());
+            system.stop(node10);
+            system.stop(node40);
+            Thread.sleep(600);
 
-        // Dopo recover, leggiamo la 42 da più nodi e poi dump storage
-        sleep(1500);
-        log("GET key=42 da client1 (n25) e client2 (20_recovered) dopo recover");
-        n25.tell(new GetRequest(42), client1);
-        recovered20.tell(new GetRequest(42), client2);
+            clientA.tell("INFO: GET key=42 con 2 nodi down (atteso: 'GET failed: quorum not reached')", ActorRef.noSender());
+            node20r.tell(new GetRequest(42), clientA);
+            Thread.sleep(Config.T + 400); // attendiamo almeno il timeout
 
-        sleep(1500);
-        printStorage(system, "DUMP finale (post-RECOVERY)");
+            // (Facoltativo) prova UPDATE → atteso "Update failed: quorum not reached"
+            clientA.tell("INFO: UPDATE key=77 con 2 nodi down (atteso: fallimento quorum)", ActorRef.noSender());
+            node20r.tell(new UpdateRequest(77, "SoloUnaReplica"), clientA);
+            Thread.sleep(Config.T + 400);
 
-        banner("FINE TEST — Controlla nei log:");
-        log("1) Se le GET su key=42 durante WRITE sono state bloccate/ritardate o hanno restituito un valore vecchio.");
-        log("2) Dopo JOIN(25): key=23 deve avere la versione più recente sul nuovo set di responsabili.");
-        log("3) Dopo LEAVE(30): key=55 deve essere trasferita ai veri nuovi responsabili (tutte N repliche).");
-        log("4) Dopo RECOVERY(20): key=42 sul nodo recuperato deve avere la versione più recente.");
-
-        sleep(800);
-        system.terminate();
+            // ======== FINE ========
+            printSection("FINE TEST");
+            // Non tutti i nodi sono vivi; terminiamo il sistema
+        } finally {
+            Thread.sleep(1000);
+            system.terminate();
+        }
     }
 
-    // ===== Helpers =====
-    public static Props makeProps(int id) {
-        return Props.create(NodeActor.class, () -> new NodeActor(id, ring));
+    // ================== UTIL ==================
+    private static void printSection(String title) {
+        System.out.println();
+        System.out.println("================= " + title + " =================");
     }
 
-    private static void printStorage(ActorSystem system, String title) {
-        System.out.println("\n==== " + ts() + " " + title + " ====");
-        system.actorSelection("/user/*").tell("print_storage", ActorRef.noSender());
-        sleep(700);
-        System.out.println("==== END " + title + " ====\n");
-    }
-
-    private static void banner(String title) {
-        System.out.println("\n================= " + title + " =================");
-    }
-
-    private static String ts() {
-        return "[" + LocalTime.now().format(fmt) + "]";
-    }
-
-    private static void log(String s) {
-        System.out.println(ts() + " " + s);
-    }
-
-    private static void sleep(int ms) {
-        try { Thread.sleep(ms); } catch (InterruptedException e) { e.printStackTrace(); }
+    // Client minimale che stampa qualunque risposta/stringa
+    public static class TestClient extends AbstractActor {
+        @Override
+        public Receive createReceive() {
+            return receiveBuilder()
+                .match(String.class, msg -> System.out.println("[Client] " + msg))
+                .matchAny(msg -> System.out.println("[Client] Received response: " + msg))
+                .build();
+        }
     }
 }

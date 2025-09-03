@@ -12,11 +12,12 @@ public class NodeActor extends AbstractActor {
     private final RingManager ringManager;
     private final Map<Integer, ValueResponse> localStorage;
 
+    // === GET state ===
     private final Map<Integer, List<ValueResponse>> pendingGets = new HashMap<>();
     private final Map<Integer, ActorRef> pendingClients = new HashMap<>();
     private final Map<Integer, Cancellable> getTimeouts = new HashMap<>();
 
-    // CONTEXT PER GESTIRE WRITE SERIALIZZATE
+    // === WRITE state (serializzazione per chiave) ===
     private static class WriteCtx {
         final UpdateRequest req;
         final ActorRef client;
@@ -32,6 +33,11 @@ public class NodeActor extends AbstractActor {
     private final Map<Integer, Deque<WriteCtx>> writeQueues = new HashMap<>();
     private final Map<Integer, WriteCtx> inFlightWrite = new HashMap<>();
 
+    // === RECOVERY state ===
+    private boolean recovering = false;
+    private ActorRef recoveryBootstrap = ActorRef.noSender();
+
+    // === Config ===
     int W = Config.W;
     int R = Config.R;
     int TIMEOUT = Config.T;
@@ -44,6 +50,7 @@ public class NodeActor extends AbstractActor {
         this.localStorage = PersistentStorage.getStorage(id);
     }
 
+    // Delay helper per simulare rete affidabile FIFO con jitter
     private void delayedTell(ActorRef target, Object message) {
         int delay = ThreadLocalRandom.current().nextInt(MIN_DELAY_MS, MAX_DELAY_MS);
         getContext().getSystem().scheduler().scheduleOnce(
@@ -53,6 +60,7 @@ public class NodeActor extends AbstractActor {
         );
     }
 
+    // Avvio della prossima write (se idle) sulla key
     private void startNextWriteIfIdle(int key) {
         if (inFlightWrite.containsKey(key)) return;
         Deque<WriteCtx> q = writeQueues.get(key);
@@ -78,10 +86,39 @@ public class NodeActor extends AbstractActor {
         );
     }
 
+    // === Helpers RECOVERY ===
+    private void dropKeysNotResponsibleAnymore() {
+        Set<Integer> keys = new HashSet<>(localStorage.keySet());
+        for (Integer k : keys) {
+            List<ActorRef> resp = ringManager.getResponsibleNodes(k);
+            if (!resp.contains(getSelf())) {
+                localStorage.remove(k);
+            }
+        }
+    }
+
+    private void readBackAllResponsibleKeys() {
+        // Aggiorna le versioni per tutte le chiavi che possiedi e sei responsabile
+        for (Integer k : new HashSet<>(localStorage.keySet())) {
+            getSelf().tell(new GetRequest(k), getSelf()); // la risposta stringa verso self è ignorata
+        }
+    }
+
+    // Fallback se non viene passato un bootstrap nel RecoverRequest(int)
+    private ActorRef pickBootstrapFromRing() {
+        for (Map.Entry<Integer, ActorRef> e : ringManager.getNodeMap().entrySet()) {
+            if (!e.getValue().equals(getSelf())) return e.getValue();
+        }
+        return null;
+    }
+
     @Override
     public Receive createReceive() {
         return receiveBuilder()
+
+            // =========================================
             // UPDATE — enqueue e processa una alla volta per chiave
+            // =========================================
             .match(UpdateRequest.class, msg -> {
                 System.out.println("[Node " + nodeId + "] Received UPDATE for key=" + msg.key + " value=" + msg.value);
                 List<ActorRef> responsible = ringManager.getResponsibleNodes(msg.key);
@@ -111,7 +148,6 @@ public class NodeActor extends AbstractActor {
                 ctx.versions.add(msg.version);
 
                 if (ctx.versions.size() >= W) {
-                    // calcolo versione rispetto alle versioni ricevute e a quella locale
                     int localVersion = localStorage.getOrDefault(msg.key, new ValueResponse(msg.key, "", 0)).version;
                     int newVersion = Math.max(Collections.max(ctx.versions), localVersion) + 1;
 
@@ -139,16 +175,17 @@ public class NodeActor extends AbstractActor {
                 }
             })
 
-            // GET → (SC) rifiuta se c'è una WRITE in corso/in coda; altrimenti quorum R e versione massima
+            // =========================================
+            // GET — (SC) rifiuta se esiste WRITE in corso/in coda; altrimenti quorum R
+            // =========================================
             .match(GetRequest.class, msg -> {
-                // --- SC minimale: rifiuta la GET se c'è una WRITE in corso o in coda su questa key ---
                 boolean writeOngoing = inFlightWrite.containsKey(msg.key);
                 boolean writeQueued = writeQueues.getOrDefault(msg.key, new ArrayDeque<>()).size() > 0;
                 if (writeOngoing || writeQueued) {
                     getSender().tell("GET rejected: overlapping write on key " + msg.key, getSelf());
                     return;
                 }
-                // --- normale gestione GET ---
+
                 List<ActorRef> responsible = ringManager.getResponsibleNodes(msg.key);
                 pendingGets.put(msg.key, new ArrayList<>());
                 pendingClients.put(msg.key, getSender());
@@ -182,10 +219,19 @@ public class NodeActor extends AbstractActor {
                 if (responses != null) {
                     responses.add(msg);
                     System.out.println("[Node " + nodeId + "] Received version " + msg.version + " for key=" + msg.key);
+
                     if (responses.size() >= R) {
                         ValueResponse latest = responses.stream()
                             .max(Comparator.comparingInt(v -> v.version))
                             .orElse(new ValueResponse(msg.key, "", 0));
+
+                        // === READ-REPAIR LOCALE ===
+                        ValueResponse cur = localStorage.get(msg.key);
+                        if (cur == null || latest.version > cur.version) {
+                            localStorage.put(msg.key, new ValueResponse(msg.key, latest.value, latest.version));
+                            System.out.println("[Node " + nodeId + "] Read-repair key=" + msg.key + " -> v=" + latest.version);
+                        }
+
                         ActorRef client = pendingClients.remove(msg.key);
                         if (client != null) {
                             client.tell("GET key=" + msg.key + " -> value=" + latest.value + " [v=" + latest.version + "]", getSelf());
@@ -197,24 +243,18 @@ public class NodeActor extends AbstractActor {
                 }
             })
 
-            // === JOIN ===
+
+            // =========================================
+            // JOIN
+            // =========================================
             .match(JoinRequest.class, msg -> {
                 delayedTell(msg.newNode, new NodeListResponse(ringManager.getNodeMap()));
             })
 
-            .match(NodeListResponse.class, msg -> {
-                for (Map.Entry<Integer, ActorRef> entry : msg.nodes.entrySet()) {
-                    ringManager.addNode(entry.getKey(), entry.getValue());
-                }
-                ringManager.addNode(nodeId, getSelf());
-                ActorRef successor = ringManager.getClockwiseSuccessor(nodeId);
-                delayedTell(successor, new TransferKeysRequest(nodeId));
-            })
-
             .match(TransferKeysRequest.class, msg -> {
+                // Questo handler è chiamato dal donatore, quando un nuovo nodo entra (JOIN).
                 ringManager.addNode(msg.newNodeId, getSender());
 
-                // Snapshot per evitare ConcurrentModification durante la rimozione
                 List<Map.Entry<Integer, ValueResponse>> snapshot = new ArrayList<>(localStorage.entrySet());
                 Map<Integer, ValueResponse> toTransfer = new HashMap<>();
 
@@ -226,7 +266,7 @@ public class NodeActor extends AbstractActor {
                         toTransfer.put(entry.getKey(), entry.getValue());
                     }
                 }
-                // rimuovi ora (fuori dal loop)
+                // rimuovi ora (fuori dal loop) — semantica di JOIN
                 for (Integer k : toTransfer.keySet()) {
                     localStorage.remove(k);
                     System.out.println("[Node " + nodeId + "] Transferred & removed key=" + k + " to node " + msg.newNodeId);
@@ -236,7 +276,7 @@ public class NodeActor extends AbstractActor {
             })
 
             .match(TransferKeysResponse.class, msg -> {
-                // 1) ricevi e salva
+                // Ricezione dati lato nuovo nodo (JOIN)
                 for (Map.Entry<Integer, ValueResponse> entry : msg.data.entrySet()) {
                     int key = entry.getKey();
                     List<ActorRef> responsible = ringManager.getResponsibleNodes(key);
@@ -247,33 +287,83 @@ public class NodeActor extends AbstractActor {
                         localStorage.remove(key);
                     }
                 }
-                // 2) READ-BACK minimo: riusa la tua GET per allinearti alla versione più recente
+                // Read-back minimo sulle chiavi ricevute
                 for (Integer k : msg.data.keySet()) {
-                    getSelf().tell(new GetRequest(k), getSelf()); // la risposta (stringa) a self verrà ignorata
+                    getSelf().tell(new GetRequest(k), getSelf());
                 }
             })
 
-            // === RECOVERY ===
+            // =========================================
+            // RECOVERY (corretto: fetch non-distruttivo + read-back)
+            // =========================================
             .match(RecoverRequest.class, msg -> {
                 System.out.println("[Node " + nodeId + "] Handling RECOVERY");
+                recovering = true;
 
-                Map<Integer, ActorRef> currentNodes = ringManager.getNodeMap();
-                for (Map.Entry<Integer, ActorRef> entry : currentNodes.entrySet()) {
-                    if (!entry.getKey().equals(nodeId)) {
-                        ringManager.addNode(entry.getKey(), entry.getValue());
-                    }
+                ActorRef bootstrap = (msg.bootstrap != null && !msg.bootstrap.equals(ActorRef.noSender()))
+                        ? msg.bootstrap
+                        : pickBootstrapFromRing();
+
+                if (bootstrap == null) {
+                    System.out.println("[Node " + nodeId + "] RECOVERY aborted: no bootstrap available.");
+                    recovering = false;
+                    return;
                 }
-                ringManager.addNode(nodeId, getSelf());
 
-                ActorRef successor = ringManager.getClockwiseSuccessor(nodeId);
-                delayedTell(successor, new TransferKeysRequest(nodeId));
+                recoveryBootstrap = bootstrap;
+                // invia id + ActorRef per permettere al bootstrap di aggiornare la sua mappa
+                delayedTell(recoveryBootstrap, new NodeListRequest(nodeId, getSelf()));
             })
 
-            // === LEAVE ===
+            .match(RecoveryFetchRequest.class, msg -> {
+                // Lato donatore: PRIMA aggiorna la tua mappa con il nuovo ActorRef del richiedente
+                ringManager.addNode(msg.requesterId, getSender());
+
+                ActorRef requester = ringManager.getNodeMap().get(msg.requesterId);
+                Map<Integer, ValueResponse> copyForRequester = new HashMap<>();
+                for (Map.Entry<Integer, ValueResponse> e : localStorage.entrySet()) {
+                    int key = e.getKey();
+                    List<ActorRef> newResponsible = ringManager.getResponsibleNodes(key);
+                    ActorRef newPrimary = newResponsible.isEmpty() ? null : newResponsible.get(0);
+                    if (requester != null && requester.equals(newPrimary)) {
+                        copyForRequester.put(key, e.getValue());
+                    }
+                }
+                delayedTell(getSender(), new RecoveryFetchResponse(copyForRequester));
+            })
+
+            .match(RecoveryFetchResponse.class, msg -> {
+                // Lato recovering: salva e poi read-back
+                for (Map.Entry<Integer, ValueResponse> entry : msg.data.entrySet()) {
+                    int key = entry.getKey();
+                    List<ActorRef> responsible = ringManager.getResponsibleNodes(key);
+                    if (responsible.contains(getSelf())) {
+                        localStorage.put(key, entry.getValue());
+                        System.out.println("[Node " + nodeId + "] Recovery copied key=" + key + " v=" + entry.getValue().version);
+                    }
+                }
+                readBackAllResponsibleKeys();
+                recovering = false;
+                recoveryBootstrap = ActorRef.noSender();
+            })
+
+            // === rispondi a NodeListRequest (usata in RECOVERY) ===
+            .match(NodeListRequest.class, msg -> {
+                // se il richiedente è passato, aggiorna la tua mappa con il nuovo ActorRef
+                if (msg.requesterId != null && msg.requester != null) {
+                    ringManager.addNode(msg.requesterId, msg.requester);
+                }
+                // rispondi con la lista attuale dei nodi
+                delayedTell(getSender(), new NodeListResponse(ringManager.getNodeMap()));
+            })
+
+            // =========================================
+            // LEAVE
+            // =========================================
             .match(LeaveRequest.class, msg -> {
                 System.out.println("[Node " + nodeId + "] Handling LEAVE");
 
-                // invia ai veri nuovi responsabili (tutte le N repliche), non solo al successore
+                // Trasferisci ai veri nuovi responsabili (tutte le N repliche), non solo al successore
                 for (Map.Entry<Integer, ValueResponse> entry : localStorage.entrySet()) {
                     int key = entry.getKey();
                     ValueResponse vr = entry.getValue();
@@ -302,7 +392,9 @@ public class NodeActor extends AbstractActor {
                 System.out.println("[Node " + nodeId + "] Removed node " + msg.nodeId + " from ring.");
             })
 
+            // =========================================
             // DEBUG
+            // =========================================
             .matchEquals("print_storage", msg -> {
                 System.out.println("[Node " + nodeId + "] keys in localStorage: " + localStorage.keySet());
             })
