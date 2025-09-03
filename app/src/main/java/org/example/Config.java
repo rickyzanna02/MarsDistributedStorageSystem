@@ -1,6 +1,8 @@
 package org.example;
 
 public class Config {
+    // Numero di nodi nel sistema
+    public static final int NODES = 3;
 
     // Numero di repliche per nodo
     public static final int N = 3;

@@ -3,6 +3,7 @@ package org.example;
 import akka.actor.*;
 import org.example.Messages.*;
 
+import java.util.concurrent.ThreadLocalRandom;
 import java.time.Duration;
 import java.util.*;
 
@@ -21,17 +22,28 @@ public class NodeActor extends AbstractActor {
     private final Map<Integer, Cancellable> getTimeouts = new HashMap<>();
     private final Map<Integer, Cancellable> updateTimeouts = new HashMap<>();
 
+    //parametri importati da Config.java
     int W = Config.W;
     int R = Config.R;
     int TIMEOUT = Config.T;
+    int MIN_DELAY_MS = Config.MIN_DELAY_MS;
+    int MAX_DELAY_MS = Config.MAX_DELAY_MS;
 
 
     public NodeActor(int id, RingManager ringManager) {
         this.nodeId = id;
         this.ringManager = ringManager;
     }
-
     
+    private void delayedTell(ActorRef target, Object message) {
+    int delay = ThreadLocalRandom.current().nextInt(MIN_DELAY_MS, MAX_DELAY_MS);
+    getContext().getSystem().scheduler().scheduleOnce(
+        Duration.ofMillis(delay),
+        () -> target.tell(message, getSelf()),
+        getContext().getSystem().dispatcher()
+    );
+}
+
 
     @Override
     public Receive createReceive() {
@@ -41,7 +53,7 @@ public class NodeActor extends AbstractActor {
                 List<ActorRef> responsible = ringManager.getResponsibleNodes(msg.key);
                 if (responsible.contains(getSelf())) {
                     for (ActorRef replica : responsible) {
-                        replica.tell(new VersionRequest(msg.key), getSelf());
+                        delayedTell(replica, new VersionRequest(msg.key));
                     }
                     pendingWriteVersions.put(msg.key, new ArrayList<>());
                     pendingWriteRequests.put(msg.key, msg);
@@ -64,12 +76,12 @@ public class NodeActor extends AbstractActor {
                 } else {
                     ActorRef coordinator = responsible.get(0);
                     System.out.println("[Node " + nodeId + "] NOT responsible for key=" + msg.key + ", forwarding UPDATE to " + coordinator.path().name());
-                    coordinator.tell(msg, getSender());
+                    delayedTell(coordinator, msg);
                 }
             })
             .match(VersionRequest.class, msg -> {
                 int version = localStorage.getOrDefault(msg.key, new ValueResponse(msg.key, "", 0)).version;
-                getSender().tell(new VersionResponse(msg.key, version), getSelf());
+                delayedTell(getSender(), new VersionResponse(msg.key, version));
             })
             .match(VersionResponse.class, msg -> {
                 List<Integer> versions = pendingWriteVersions.get(msg.key);
@@ -85,7 +97,8 @@ public class NodeActor extends AbstractActor {
 
                         List<ActorRef> replicas = ringManager.getResponsibleNodes(msg.key);
                         for (ActorRef r : replicas) {
-                            r.tell(new UpdateInternal(msg.key, original.value, newVersion), getSelf());
+                            delayedTell(r, new UpdateInternal(msg.key, original.value, newVersion));
+
                         }
                         client.tell("Update committed with version " + newVersion, getSelf());
                     }
@@ -106,7 +119,7 @@ public class NodeActor extends AbstractActor {
                 pendingGets.put(msg.key, new ArrayList<>());
                 pendingClients.put(msg.key, getSender());
                 for (ActorRef replica : responsible) {
-                    replica.tell(new InternalGet(msg.key), getSelf());
+                    delayedTell(replica, new InternalGet(msg.key));
                 }
 
                 Cancellable timeout = getContext().getSystem().scheduler().scheduleOnce(
@@ -125,7 +138,8 @@ public class NodeActor extends AbstractActor {
             })
             .match(InternalGet.class, msg -> {
                 ValueResponse val = localStorage.getOrDefault(msg.key, new ValueResponse(msg.key, "", 0));
-                getSender().tell(val, getSelf());
+                delayedTell(getSender(), val);
+
             })
             .match(ValueResponse.class, msg -> {
                 List<ValueResponse> responses = pendingGets.get(msg.key);
@@ -147,7 +161,7 @@ public class NodeActor extends AbstractActor {
                 }
             })
             .match(JoinRequest.class, msg -> {
-                msg.newNode.tell(new NodeListResponse(ringManager.getNodeMap()), getSelf());
+                delayedTell(msg.newNode, new NodeListResponse(ringManager.getNodeMap()));
             })
             .match(NodeListResponse.class, msg -> {
                 for (Map.Entry<Integer, ActorRef> entry : msg.nodes.entrySet()) {
@@ -155,7 +169,8 @@ public class NodeActor extends AbstractActor {
                 }
                 ringManager.addNode(nodeId, getSelf());
                 ActorRef successor = ringManager.getClockwiseSuccessor(nodeId);
-                successor.tell(new TransferKeysRequest(nodeId), getSelf());
+                delayedTell(successor, new TransferKeysRequest(nodeId));
+
             })
             .match(TransferKeysRequest.class, msg -> {
                 ringManager.addNode(msg.newNodeId, getSender());
@@ -170,7 +185,8 @@ public class NodeActor extends AbstractActor {
                         System.out.println("[Node " + nodeId + "] Transferred & removed key=" + entry.getKey() + " to node " + msg.newNodeId);
                     }
                 }
-                getSender().tell(new TransferKeysResponse(toTransfer), getSelf());
+                delayedTell(getSender(), new TransferKeysResponse(toTransfer));
+
             })
             .match(TransferKeysResponse.class, msg -> {
                 for (Map.Entry<Integer, ValueResponse> entry : msg.data.entrySet()) {
@@ -196,7 +212,8 @@ public class NodeActor extends AbstractActor {
                 ringManager.addNode(nodeId, getSelf());
 
                 ActorRef successor = ringManager.getClockwiseSuccessor(nodeId);
-                successor.tell(new TransferKeysRequest(nodeId), getSelf());
+                delayedTell(successor, new TransferKeysRequest(nodeId));
+
             })
             .match(LeaveRequest.class, msg -> {
                 System.out.println("[Node " + nodeId + "] Handling LEAVE");
@@ -205,13 +222,13 @@ public class NodeActor extends AbstractActor {
                     List<ActorRef> responsible = ringManager.getResponsibleNodes(entry.getKey());
                     ActorRef newPrimary = responsible.isEmpty() ? null : responsible.get(0);
                     if (newPrimary != null && !newPrimary.equals(getSelf())) {
-                        successor.tell(new UpdateInternal(entry.getKey(), entry.getValue().value, entry.getValue().version), getSelf());
+                        delayedTell(successor, new UpdateInternal(entry.getKey(), entry.getValue().value, entry.getValue().version));
                         System.out.println("[Node " + nodeId + "] Transferred key=" + entry.getKey() + " to " + successor.path().name());
                     }
                 }
                 for (ActorRef peer : ringManager.getNodeMap().values()) {
                     if (!peer.equals(getSelf())) {
-                        peer.tell(new LeaveNotification(nodeId), getSelf());
+                        delayedTell(peer, new LeaveNotification(nodeId));
                     }
                 }
                 localStorage.clear();

@@ -8,7 +8,7 @@ public class App {
 
     public static void main(String[] args) {
         ActorSystem system = ActorSystem.create("MarsSystem");
-        ring = new RingManager(3); // N = 3
+        ring = new RingManager(Config.NODES); // numero di nodi (recuperato da config)
 
         ActorRef client1 = system.actorOf(Props.create(ClientActor.class), "client1");
         ActorRef client2 = system.actorOf(Props.create(ClientActor.class), "client2");
