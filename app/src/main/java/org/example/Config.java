@@ -17,7 +17,7 @@ public class Config {
     public static final int T = 2000;
 
     // Ritardo minimo e massimo (in ms) per simulare rete
-    public static final int MIN_DELAY_MS = 10;
-    public static final int MAX_DELAY_MS = 50;
+    public static final int MIN_DELAY_MS = 100;
+    public static final int MAX_DELAY_MS = 500;
 }
 
