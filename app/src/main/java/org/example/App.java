@@ -9,13 +9,10 @@ public class App {
     public static void main(String[] args) {
         ActorSystem system = ActorSystem.create("MarsSystem");
         ring = new RingManager(Config.NODES); // numero di nodi (recuperato da config)
-///////////////////////////
-       
 
         ActorRef client1 = system.actorOf(Props.create(ClientActor.class), "client1");
         ActorRef client2 = system.actorOf(Props.create(ClientActor.class), "client2");
 
-        // Nodo coordinatore (es: n10)
         ActorRef n10 = system.actorOf(makeProps(10), "node10");
         ActorRef n20 = system.actorOf(makeProps(20), "node20");
         ActorRef n30 = system.actorOf(makeProps(30), "node30");
@@ -24,31 +21,49 @@ public class App {
         ring.addNode(20, n20);
         ring.addNode(30, n30);
 
-        sleep(1000); // lascia tempo alla rete
-
-        System.out.println("[TEST] Persistenza: scrivo su key=101 da client1");
-        n10.tell(new UpdateRequest(101, "Humidity: 42%"), client1);
+        System.out.println("[TEST] UPDATE iniziale su key=42 da client1");
+        n10.tell(new UpdateRequest(42, "Temp: -60C"), client1);
         sleep(1000);
 
-        System.out.println("[TEST] LEAVE di node10 (simulazione crash con rimozione)");
-        n10.tell(new LeaveRequest(10), client2);
+        System.out.println("[TEST] GET su key=42 da client2");
+        n20.tell(new GetRequest(42), client2);
         sleep(1000);
 
-        // Rimuovo manualmente dalla ring, per simulare l’effetto di un crash
-        ring.removeNode(10);
-
-        System.out.println("[TEST] RECOVERY di node10 (nuovo attore, stesso ID)");
-        ActorRef recovered10 = system.actorOf(makeProps(10), "node10_recovered");
-        ring.addNode(10, recovered10);
-        recovered10.tell(new RecoverRequest(10), client1);
+        System.out.println("[TEST] JOIN di node25");
+        ActorRef n25 = system.actorOf(makeProps(25), "node25");
+        n10.tell(new JoinRequest(25, n25), client1);
         sleep(1000);
 
-        System.out.println("[TEST] GET su key=101 da node10_recovered (dovrebbe avere valore precedente)");
-        recovered10.tell(new GetRequest(101), client2);
+        System.out.println("[TEST] UPDATE su key=42 da client2 (valore aggiornato)");
+        n25.tell(new UpdateRequest(42, "Temp: -59C"), client2);
+        sleep(1000);
+
+        System.out.println("[TEST] LEAVE di node30");
+        n30.tell(new LeaveRequest(30), client1);
         sleep(1500);
 
-        System.out.println("[TEST] Stato dello storage dopo recovery:");
+        System.out.println("[TEST] Simulazione crash di node20");
+        system.stop(n20);
+        sleep(500);
+
+        System.out.println("[TEST] UPDATE su key=55 da client1");
+        n10.tell(new UpdateRequest(55, "CO2: 12%"), client1);
+        sleep(1500);
+
+        System.out.println("[TEST] RECOVERY di node20");
+        ActorRef recovered20 = system.actorOf(makeProps(20), "node20_recovered");
+        ring.addNode(20, recovered20);
+        recovered20.tell(new RecoverRequest(20), client2);
+        sleep(1500);
+
+        System.out.println("[TEST] GET concorrente su key=42 da entrambi i client");
+        n25.tell(new GetRequest(42), client1);
+        recovered20.tell(new GetRequest(42), client2);
+        sleep(1500);
+
+        System.out.println("[TEST] Stato finale dello storage di tutti i nodi:");
         printStorage(system);
+        sleep(1000);
 
         system.terminate();
     }

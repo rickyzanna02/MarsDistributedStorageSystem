@@ -194,6 +194,86 @@ public class NodeActor extends AbstractActor {
                     }
                 }
             })
+            .match(JoinRequest.class, msg -> {
+                delayedTell(msg.newNode, new NodeListResponse(ringManager.getNodeMap()));
+            })
+            .match(NodeListResponse.class, msg -> {
+                for (Map.Entry<Integer, ActorRef> entry : msg.nodes.entrySet()) {
+                    ringManager.addNode(entry.getKey(), entry.getValue());
+                }
+                ringManager.addNode(nodeId, getSelf());
+                ActorRef successor = ringManager.getClockwiseSuccessor(nodeId);
+                delayedTell(successor, new TransferKeysRequest(nodeId));
+
+            })
+            .match(TransferKeysRequest.class, msg -> {
+                ringManager.addNode(msg.newNodeId, getSender());
+                Map<Integer, ValueResponse> toTransfer = new HashMap<>();
+                for (Map.Entry<Integer, ValueResponse> entry : localStorage.entrySet()) {
+                    List<ActorRef> newResponsible = ringManager.getResponsibleNodes(entry.getKey());
+                    ActorRef newPrimary = newResponsible.isEmpty() ? null : newResponsible.get(0);
+                    ActorRef targetNode = ringManager.getNodeMap().get(msg.newNodeId);
+                    if (targetNode != null && targetNode.equals(newPrimary)) {
+                        toTransfer.put(entry.getKey(), entry.getValue());
+                        localStorage.remove(entry.getKey());
+                        System.out.println("[Node " + nodeId + "] Transferred & removed key=" + entry.getKey() + " to node " + msg.newNodeId);
+                    }
+                }
+                delayedTell(getSender(), new TransferKeysResponse(toTransfer));
+
+            })
+            .match(TransferKeysResponse.class, msg -> {
+                for (Map.Entry<Integer, ValueResponse> entry : msg.data.entrySet()) {
+                    int key = entry.getKey();
+                    List<ActorRef> responsible = ringManager.getResponsibleNodes(key);
+                    if (responsible.contains(getSelf())) {
+                        localStorage.put(key, entry.getValue());
+                        System.out.println("[Node " + nodeId + "] Recovered key=" + key);
+                    } else {
+                        localStorage.remove(key);
+                    }
+                }
+            })
+            .match(RecoverRequest.class, msg -> {
+                System.out.println("[Node " + nodeId + "] Handling RECOVERY");
+
+                Map<Integer, ActorRef> currentNodes = ringManager.getNodeMap();
+                for (Map.Entry<Integer, ActorRef> entry : currentNodes.entrySet()) {
+                    if (!entry.getKey().equals(nodeId)) {
+                        ringManager.addNode(entry.getKey(), entry.getValue());
+                    }
+                }
+                ringManager.addNode(nodeId, getSelf());
+
+                ActorRef successor = ringManager.getClockwiseSuccessor(nodeId);
+                delayedTell(successor, new TransferKeysRequest(nodeId));
+
+            })
+            .match(LeaveRequest.class, msg -> {
+                System.out.println("[Node " + nodeId + "] Handling LEAVE");
+                ActorRef successor = ringManager.getClockwiseSuccessor(nodeId);
+                for (Map.Entry<Integer, ValueResponse> entry : localStorage.entrySet()) {
+                    List<ActorRef> responsible = ringManager.getResponsibleNodes(entry.getKey());
+                    ActorRef newPrimary = responsible.isEmpty() ? null : responsible.get(0);
+                    if (newPrimary != null && !newPrimary.equals(getSelf())) {
+                        delayedTell(successor, new UpdateInternal(entry.getKey(), entry.getValue().value, entry.getValue().version));
+                        System.out.println("[Node " + nodeId + "] Transferred key=" + entry.getKey() + " to " + successor.path().name());
+                    }
+                }
+                for (ActorRef peer : ringManager.getNodeMap().values()) {
+                    if (!peer.equals(getSelf())) {
+                        delayedTell(peer, new LeaveNotification(nodeId));
+                    }
+                }
+                localStorage.clear();
+                ringManager.removeNode(nodeId);
+                getSender().tell(new LeaveAck(nodeId), getSelf());
+                getContext().stop(getSelf());
+            })
+            .match(LeaveNotification.class, msg -> {
+                ringManager.removeNode(msg.nodeId);
+                System.out.println("[Node " + nodeId + "] Removed node " + msg.nodeId + " from ring.");
+            })
 
             // DEBUG
             .matchEquals("print_storage", msg -> {
