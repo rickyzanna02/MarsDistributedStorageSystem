@@ -21,9 +21,10 @@ public class NodeActor extends AbstractActor {
     private final Map<Integer, Cancellable> getTimeouts = new HashMap<>();
     private final Map<Integer, Cancellable> updateTimeouts = new HashMap<>();
 
-    private static final int W = 3;
-    private static final int R = 3;
-    private static final int TIMEOUT_MS = 1000;
+    int W = Config.W;
+    int R = Config.R;
+    int TIMEOUT = Config.T;
+
 
     public NodeActor(int id, RingManager ringManager) {
         this.nodeId = id;
@@ -47,7 +48,7 @@ public class NodeActor extends AbstractActor {
                     pendingWriteClients.put(msg.key, getSender());
 
                     Cancellable timeout = getContext().getSystem().scheduler().scheduleOnce(
-                        Duration.ofMillis(TIMEOUT_MS),
+                        Duration.ofMillis(TIMEOUT),
                         () -> {
                             if (pendingWriteClients.containsKey(msg.key)) {
                                 pendingWriteClients.get(msg.key).tell("Update failed: quorum not reached", getSelf());
@@ -109,7 +110,7 @@ public class NodeActor extends AbstractActor {
                 }
 
                 Cancellable timeout = getContext().getSystem().scheduler().scheduleOnce(
-                    Duration.ofMillis(TIMEOUT_MS),
+                    Duration.ofMillis(TIMEOUT),
                     () -> {
                         if (pendingClients.containsKey(msg.key)) {
                             pendingClients.get(msg.key).tell("GET failed: quorum not reached", getSelf());
