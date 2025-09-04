@@ -60,6 +60,23 @@ public class Messages {
         public JoinRequest(int newId, ActorRef newNode) { this.newId = newId; this.newNode = newNode; }
     }
 
+    public static class DataItem implements java.io.Serializable {
+        public final int key;
+        public final String value;
+        public final int version;
+        public DataItem(int key, String value, int version) {
+            this.key = key; this.value = value; this.version = version;
+        }
+    }
+
+    public static class JoinNotification implements java.io.Serializable {
+        public final int nodeId;
+        public final akka.actor.ActorRef ref;
+        public JoinNotification(int nodeId, akka.actor.ActorRef ref) {
+            this.nodeId = nodeId; this.ref = ref;
+        }
+    }
+
     // NodeListRequest con costruttore vuoto (usato dal RECOVERY) + variante con campi (se ti serve altrove)
     public static class NodeListRequest implements Serializable {
         public final Integer requesterId;   // può essere null
@@ -131,5 +148,11 @@ public class Messages {
     public static class RecoveryFetchResponse implements Serializable {
         public final Map<Integer, ValueResponse> data;
         public RecoveryFetchResponse(Map<Integer, ValueResponse> data) { this.data = data; }
+    }
+
+    /** (Facoltativo) Notifica di fine trasferimento al termine di join/recovery per sbloccare step successivi. */
+    public static class TransferDone implements java.io.Serializable {
+        public final int forNodeId;
+        public TransferDone(int forNodeId){ this.forNodeId = forNodeId; }
     }
 }

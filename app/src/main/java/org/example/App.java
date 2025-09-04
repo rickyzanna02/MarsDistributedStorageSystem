@@ -7,7 +7,7 @@ public class App {
 
     public static void main(String[] args) throws Exception {
         final ActorSystem system = ActorSystem.create("ds1");
-        final RingManager ring = new RingManager(Config.NODES);
+        final RingManager ring = new RingManager(Config.N);
 
         try {
             // ======== NODI INIZIALI (3) ========
