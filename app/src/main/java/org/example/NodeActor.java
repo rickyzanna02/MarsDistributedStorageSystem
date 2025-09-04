@@ -13,9 +13,17 @@ public class NodeActor extends AbstractActor {
     private final Map<Integer, ValueResponse> localStorage;
 
     // === GET state ===
+    // supporto multi-client per la stessa key
     private final Map<Integer, List<ValueResponse>> pendingGets = new HashMap<>();
-    private final Map<Integer, ActorRef> pendingClients = new HashMap<>();
+    private final Map<Integer, List<ActorRef>> pendingClients = new HashMap<>();
     private final Map<Integer, Cancellable> getTimeouts = new HashMap<>();
+    // contatore risposte "pending" per key (per SC cross-nodo: rifiuto GET)
+    private final Map<Integer, Integer> getPendingCounters = new HashMap<>();
+
+    // === WRITE state (per SC cross-nodo) ===
+    // chiavi per cui questa replica è "in scrittura" (VersionRequest in corso o commit UpdateInternal in corso)
+    private final Set<Integer> pendingWrites = new HashSet<>();
+    private final Map<Integer, Cancellable> pendingWriteTimers = new HashMap<>();
 
     // === WRITE state (serializzazione per chiave) ===
     private static class WriteCtx {
@@ -34,8 +42,8 @@ public class NodeActor extends AbstractActor {
     private final Map<Integer, WriteCtx> inFlightWrite = new HashMap<>();
 
     // === JOIN / RECOVERY stato ===
-    private boolean recovering = false;           // true durante recovery
-    private boolean joining = false;             // true durante join (nuovo nodo)
+    private boolean recovering = false;        // true durante recovery
+    private boolean joining = false;           // true durante join (nuovo nodo)
     private ActorRef recoveryBootstrap = ActorRef.noSender();
 
     // === Config ===
@@ -51,12 +59,22 @@ public class NodeActor extends AbstractActor {
         this.localStorage = PersistentStorage.getStorage(id);
     }
 
-    // Delay helper per simulare rete affidabile con jitter
+    // Delay helper per simulare rete affidabile con jitter (sender = self)
     private void delayedTell(ActorRef target, Object message) {
         int delay = ThreadLocalRandom.current().nextInt(MIN_DELAY_MS, MAX_DELAY_MS);
         getContext().getSystem().scheduler().scheduleOnce(
             Duration.ofMillis(delay),
             () -> target.tell(message, getSelf()),
+            getContext().getSystem().dispatcher()
+        );
+    }
+
+    // overload: preserva il sender originale
+    private void delayedTell(ActorRef target, Object message, ActorRef originalSender) {
+        int delay = ThreadLocalRandom.current().nextInt(MIN_DELAY_MS, MAX_DELAY_MS);
+        getContext().getSystem().scheduler().scheduleOnce(
+            Duration.ofMillis(delay),
+            () -> target.tell(message, originalSender),
             getContext().getSystem().dispatcher()
         );
     }
@@ -70,6 +88,7 @@ public class NodeActor extends AbstractActor {
         WriteCtx ctx = q.pollFirst();
         inFlightWrite.put(key, ctx);
 
+        // VersionRequest verso tutte le repliche (incluso il primario)
         for (ActorRef replica : ringManager.getResponsibleNodes(key)) {
             delayedTell(replica, new VersionRequest(key));
         }
@@ -100,7 +119,7 @@ public class NodeActor extends AbstractActor {
 
     private void readBackAllResponsibleKeys() {
         for (Integer k : new HashSet<>(localStorage.keySet())) {
-            getSelf().tell(new GetRequest(k), getSelf()); // la risposta stringa verso self è ignorata
+            getSelf().tell(new GetRequest(k), getSelf()); // risposta stringa verso self ignorata
         }
     }
 
@@ -117,6 +136,15 @@ public class NodeActor extends AbstractActor {
         return ringManager.getNodeMap().get(id);
     }
 
+    // cleanup stato GET per una key
+    private void finishGet(int key) {
+        pendingGets.remove(key);
+        pendingClients.remove(key);
+        getPendingCounters.remove(key);
+        Cancellable t = getTimeouts.remove(key);
+        if (t != null) t.cancel();
+    }
+
     @Override
     public Receive createReceive() {
         return receiveBuilder()
@@ -124,13 +152,12 @@ public class NodeActor extends AbstractActor {
             // =========================================
             // UPDATE — enqueue e processa una alla volta per chiave
             // =========================================
-        .match(UpdateRequest.class, msg -> {
-            System.out.println("[Node " + nodeId + "] Received UPDATE for key=" + msg.key + " value=" + msg.value);
+            .match(UpdateRequest.class, msg -> {
+                System.out.println("[Node " + nodeId + "] Received UPDATE for key=" + msg.key + " value=" + msg.value);
 
-            // Determina i responsabili e il primario
-            List<ActorRef> responsible = ringManager.getResponsibleNodes(msg.key);
+                // Determina i responsabili e il primario
+                List<ActorRef> responsible = ringManager.getResponsibleNodes(msg.key);
                 if (responsible == null || responsible.isEmpty()) {
-                    // Anello vuoto o errore in RingManager: rispondi al client con errore e abortisci
                     ActorRef client = getSender();
                     if (client != null) {
                         client.tell("UPDATE failed: no responsible nodes for key " + msg.key, getSelf());
@@ -141,25 +168,38 @@ public class NodeActor extends AbstractActor {
 
                 ActorRef primary = responsible.get(0);
 
-                // Se non sono il primario, inoltro SEMPRE a lui (coordinamento unico)
+                // forwarding se non sono il primario, preservando il sender
                 if (!getSelf().equals(primary)) {
                     System.out.println("[Node " + nodeId + "] Not primary for key=" + msg.key +
-                                    " (primary=" + primary.path().name() + "), forwarding UPDATE");
-                    delayedTell(primary, msg); // mantiene lo stesso comportamento di inoltro già usato nel tuo codice
+                            " (primary=" + primary.path().name() + "), forwarding UPDATE");
+                    delayedTell(primary, msg, getSender());
                     return;
                 }
 
-                // Da qui in poi: sono il PRIMARIO -> coordino la write
+                // sono il primario: coordino la write
                 writeQueues.computeIfAbsent(msg.key, k -> new ArrayDeque<>())
-                        .addLast(new WriteCtx(msg, getSender())); // salva il client originale
+                        .addLast(new WriteCtx(msg, getSender())); // salva client originale
 
-                // Avvia la write se non ce n'è già una in corso per la chiave
                 startNextWriteIfIdle(msg.key);
             })
 
-
-            // Risposta con la versione corrente
+            // Replica risponde con la versione corrente
+            // marca la key come "pending write" per SC cross-nodo
             .match(VersionRequest.class, msg -> {
+                // imposta pending per TIMEOUT; cancella timer precedente se presente
+                Cancellable old = pendingWriteTimers.remove(msg.key);
+                if (old != null) old.cancel();
+                pendingWrites.add(msg.key);
+                Cancellable t = getContext().getSystem().scheduler().scheduleOnce(
+                    Duration.ofMillis(TIMEOUT),
+                    () -> {
+                        pendingWrites.remove(msg.key);
+                        pendingWriteTimers.remove(msg.key);
+                    },
+                    getContext().getSystem().dispatcher()
+                );
+                pendingWriteTimers.put(msg.key, t);
+
                 int version = localStorage.getOrDefault(msg.key, new ValueResponse(msg.key, "", 0)).version;
                 delayedTell(getSender(), new VersionResponse(msg.key, version));
             })
@@ -189,6 +229,7 @@ public class NodeActor extends AbstractActor {
             })
 
             // Replica salva il valore aggiornato se ha versione più alta
+            // e rimuove il flag di pending write
             .match(UpdateInternal.class, msg -> {
                 ValueResponse existing = localStorage.get(msg.key);
                 if (existing == null || msg.version > existing.version) {
@@ -197,23 +238,36 @@ public class NodeActor extends AbstractActor {
                 } else {
                     System.out.println("[Node " + nodeId + "] Ignored outdated update for key=" + msg.key + " v=" + msg.version);
                 }
+                Cancellable pt = pendingWriteTimers.remove(msg.key);
+                if (pt != null) pt.cancel();
+                pendingWrites.remove(msg.key);
             })
 
             // =========================================
-            // GET — (SC) rifiuta se esiste WRITE in corso/in coda; altrimenti quorum R
+            // GET — SC locale: rifiuta se c'è WRITE in corso/in coda sulla stessa key
             // =========================================
             .match(GetRequest.class, msg -> {
                 boolean writeOngoing = inFlightWrite.containsKey(msg.key);
-                boolean writeQueued = writeQueues.getOrDefault(msg.key, new ArrayDeque<>()).size() > 0;
-                if (writeOngoing || writeQueued) {
+                //boolean writeQueued = writeQueues.getOrDefault(msg.key, new ArrayDeque<>()).size() > 0;
+                if (writeOngoing ) {
                     getSender().tell("GET rejected: overlapping write on key " + msg.key, getSelf());
                     return;
                 }
 
-                List<ActorRef> responsible = ringManager.getResponsibleNodes(msg.key);
-                pendingGets.put(msg.key, new ArrayList<>());
-                pendingClients.put(msg.key, getSender());
+                // Accoda il client per risposta condivisa
+                List<ActorRef> clients = pendingClients.computeIfAbsent(msg.key, k -> new ArrayList<>());
+                clients.add(getSender());
 
+                // Se esiste già una GET pendente per la stessa key, non rilanciare InternalGet
+                if (pendingGets.containsKey(msg.key)) {
+                    return;
+                }
+
+                // Prima GET per questa key: avvia fan-out e timeout
+                pendingGets.put(msg.key, new ArrayList<>());
+                getPendingCounters.put(msg.key, 0);
+
+                List<ActorRef> responsible = ringManager.getResponsibleNodes(msg.key);
                 for (ActorRef replica : responsible) {
                     delayedTell(replica, new InternalGet(msg.key));
                 }
@@ -221,49 +275,83 @@ public class NodeActor extends AbstractActor {
                 Cancellable timeout = getContext().getSystem().scheduler().scheduleOnce(
                     Duration.ofMillis(TIMEOUT),
                     () -> {
-                        if (pendingClients.containsKey(msg.key)) {
-                            pendingClients.get(msg.key).tell("GET failed: quorum not reached", getSelf());
-                            pendingClients.remove(msg.key);
-                            pendingGets.remove(msg.key);
-                            getTimeouts.remove(msg.key);
+                        // alla scadenza, se non abbiamo deciso, fallisci per quorum
+                        List<ActorRef> cl = pendingClients.get(msg.key);
+                        if (cl != null && !cl.isEmpty()) {
+                            for (ActorRef c : cl) c.tell("GET failed: quorum not reached", getSelf());
                         }
+                        finishGet(msg.key);
                     },
                     getContext().getSystem().dispatcher()
                 );
                 getTimeouts.put(msg.key, timeout);
             })
 
+            // Replica risponde alla GET interna
+            // se c'è una write pendente, risponde con PendingResponse
             .match(InternalGet.class, msg -> {
-                ValueResponse val = localStorage.getOrDefault(msg.key, new ValueResponse(msg.key, "", 0));
-                delayedTell(getSender(), val);
+                if (pendingWrites.contains(msg.key)) {
+                    delayedTell(getSender(), new PendingResponse(msg.key));
+                } else {
+                    ValueResponse val = localStorage.getOrDefault(msg.key, new ValueResponse(msg.key, "", 0));
+                    delayedTell(getSender(), val);
+                }
             })
 
+            // Coordinatore GET: riceve segnale di pending → SC "dura" (rifiuta GET)
+            .match(PendingResponse.class, msg -> {
+                final ActorRef pendingReplica = getSender();
+                getContext().getSystem().scheduler().scheduleOnce(
+                    Duration.ofMillis(ThreadLocalRandom.current().nextInt(MIN_DELAY_MS, MAX_DELAY_MS)),
+                    () -> pendingReplica.tell(new InternalGet(msg.key), getSelf()),
+                    getContext().getSystem().dispatcher()
+                );
+
+
+                
+            })
+
+            // Coordinatore aggrega le risposte di GET (non-pending)
             .match(ValueResponse.class, msg -> {
                 List<ValueResponse> responses = pendingGets.get(msg.key);
-                if (responses != null) {
-                    responses.add(msg);
-                    System.out.println("[Node " + nodeId + "] Received version " + msg.version + " for key=" + msg.key);
+                if (responses == null) return; // GET già decisa o non esiste
 
-                    if (responses.size() >= R) {
-                        ValueResponse latest = responses.stream()
-                            .max(Comparator.comparingInt(v -> v.version))
-                            .orElse(new ValueResponse(msg.key, "", 0));
+                // conta come "ok"
+                responses.add(msg);
+                System.out.println("[Node " + nodeId + "] Received version " + msg.version + " for key=" + msg.key);
 
-                        // === READ-REPAIR LOCALE ===
-                        ValueResponse cur = localStorage.get(msg.key);
-                        if (cur == null || latest.version > cur.version) {
-                            localStorage.put(msg.key, new ValueResponse(msg.key, latest.value, latest.version));
-                            System.out.println("[Node " + nodeId + "] Read-repair key=" + msg.key + " -> v=" + latest.version);
+                if (responses.size() >= R) {
+                    // prendi la versione massima tra quelle ricevute (>=R)
+                    ValueResponse latest = responses.stream()
+                        .max(Comparator.comparingInt(v -> v.version))
+                        .orElse(new ValueResponse(msg.key, "", 0));
+
+                    List<ActorRef> clients = pendingClients.get(msg.key);
+
+                    if (latest.version == 0) {
+                        // esplicita "not found" se la migliore è v=0
+                        if (clients != null) {
+                            for (ActorRef c : clients) {
+                                c.tell("GET failed: not found", getSelf());
+                            }
                         }
-
-                        ActorRef client = pendingClients.remove(msg.key);
-                        if (client != null) {
-                            client.tell("GET key=" + msg.key + " -> value=" + latest.value + " [v=" + latest.version + "]", getSelf());
-                        }
-                        pendingGets.remove(msg.key);
-                        Cancellable timeout = getTimeouts.remove(msg.key);
-                        if (timeout != null) timeout.cancel();
+                        finishGet(msg.key);
+                        return;
                     }
+
+                    // === READ-REPAIR LOCALE (solo se latest > locale) ===
+                    ValueResponse cur = localStorage.get(msg.key);
+                    if (cur == null || latest.version > cur.version) {
+                        localStorage.put(msg.key, new ValueResponse(msg.key, latest.value, latest.version));
+                        System.out.println("[Node " + nodeId + "] Read-repair key=" + msg.key + " -> v=" + latest.version);
+                    }
+
+                    if (clients != null) {
+                        for (ActorRef c : clients) {
+                            c.tell("GET key=" + msg.key + " -> value=" + latest.value + " [v=" + latest.version + "]", getSelf());
+                        }
+                    }
+                    finishGet(msg.key);
                 }
             })
 
@@ -281,7 +369,7 @@ public class NodeActor extends AbstractActor {
                 for (Map.Entry<Integer, ActorRef> e : msg.nodes.entrySet()) {
                     ringManager.addNode(e.getKey(), e.getValue());
                 }
-                ringManager.addNode(nodeId, getSelf()); // assicurati che ci siamo anche noi
+                ringManager.addNode(nodeId, getSelf()); // assicura presenza di self
 
                 if (recovering) {
                     // Caso RECOVERY: drop e fetch dai peer
@@ -320,7 +408,7 @@ public class NodeActor extends AbstractActor {
                     ActorRef newPrimary = newResponsible.isEmpty() ? null : newResponsible.get(0);
                     if (targetNode != null && targetNode.equals(newPrimary)) {
                         toTransfer.put(key, entry.getValue());
-                        // RIMOZIONE differita: toglieremo dopo aver notificato
+                        // rimozione differita: toglieremo dopo la notifica
                     }
                 }
 
@@ -416,7 +504,7 @@ public class NodeActor extends AbstractActor {
                 recoveryBootstrap = ActorRef.noSender();
             })
 
-            // === rispondi a NodeListRequest (usata in RECOVERY)
+            // rispondi a NodeListRequest (usata in RECOVERY)
             .match(NodeListRequest.class, msg -> {
                 if (msg.requesterId != null && msg.requester != null) {
                     ringManager.addNode(msg.requesterId, msg.requester);

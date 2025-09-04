@@ -14,10 +14,12 @@ public class Config {
     public static final int W = 2;
 
     // Timeout massimo in millisecondi per ottenere R o W risposte
-    public static final int T = 2000;
+    public static final int T = 1000;
 
     // Ritardo minimo e massimo (in ms) per simulare rete
-    public static final int MIN_DELAY_MS = 100;
-    public static final int MAX_DELAY_MS = 500;
+    public static final int MIN_DELAY_MS = 50;
+    public static final int MAX_DELAY_MS = 300;
+
+    public static final int ENDTESTPAUSE = 2000;
 }
 

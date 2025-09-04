@@ -102,6 +102,12 @@ public class Messages {
         public TransferKeysResponse(Map<Integer, ValueResponse> data) { this.data = data; }
     }
 
+    public static final class PendingResponse implements Serializable {
+        public final int key;
+        public PendingResponse(int key) { this.key = key; }
+        @Override public String toString() { return "PendingResponse{key=" + key + "}"; }
+    }
+
     // ========= LEAVE =========
     public static class LeaveRequest implements Serializable {
         public final int nodeId;
