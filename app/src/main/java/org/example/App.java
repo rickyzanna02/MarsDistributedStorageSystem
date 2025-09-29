@@ -1,5 +1,7 @@
-package org.example;
+//APP.JAVA: main class to test the system.
 
+
+package org.example;
 import akka.actor.*;
 import org.example.Messages.*;
 
@@ -7,7 +9,7 @@ public class App {
 
     public static void main(String[] args) throws Exception {
         final ActorSystem system = ActorSystem.create("ds1");
-        final RingManager ring = new RingManager(Config.N); // usa N (replication factor)
+        final RingManager ring = new RingManager(Config.N); // N (replication factor)
 
         try {
             // ======== NODI INIZIALI (3) ========

@@ -1,10 +1,10 @@
-package org.example;
+// CLIENTACTOR.JAVA: defines a simple client actor used to interact with the distributed system.
+// It receives responses from nodes (string) and prints them to the console.
 
+package org.example;
 import akka.actor.AbstractActor;
-//import org.example.Messages.*;
 
 public class ClientActor extends AbstractActor {
-
     @Override
     public Receive createReceive() {
         return receiveBuilder()
