@@ -85,13 +85,15 @@ All strategies ensure that data is sent **only to nodes responsible for it**.
 ---
 
 ## 🚀 How to run
-1. Compile the project with Gradle or Maven (Java 8+).  
-2. Run `App.java` to start the actor system and execute the predefined test scenarios.  
+1. Install Gradle and import the project files. 
+2. Build the project with `gradle build` 
+2. Execute with  `gradle run` to start the actor system and execute the predefined test scenarios.  
 3. Logs in the console will show step-by-step behavior: quorum checks, updates, reads, joins, leaves, crash/recovery.
 
 ---
 
 ## 👥 Authors
-- *Your Name* (Project implementation, documentation)
+- *Cappellaro Nicola* - nicola.cappellaro@studenti.unitn.it
+- *Zannoni Riccardo* - riccardo.zannoni@studenti.unitn.it
 
 
